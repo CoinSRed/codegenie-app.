@@ -200,9 +200,17 @@
         signals: res.signals || [],
         persisted: res.persisted !== false,
         truncated: !!res.truncated,
+        detectedPackage: res.detectedPackage || null,
+        detectedLabel: res.detectedLabel || null,
+        suggestedPackage: res.suggestedPackage || null,
       };
 
-      $("#inputGameName").value = res.displayName || "";
+      // Auto-detected game: use the installed app's real name and icon.
+      $("#inputGameName").value = res.detectedLabel || res.displayName || "";
+      if (res.detectedIcon) {
+        pendingCoverDataUrl = res.detectedIcon;
+        $("#coverPreview").style.backgroundImage = `url(${res.detectedIcon})`;
+      }
       renderDetectedInfo(pendingImport);
       renderPackageField(pendingImport);
       showDetailsStep();
@@ -248,6 +256,9 @@
       case "package-ref":
         line = `This folder is linked to the installed app "${info.payload}". It will launch directly.`;
         break;
+      case "installed-app":
+        line = `Recognised the installed game "${info.detectedLabel || info.payload}" (${info.payload}) from this folder. Play will launch it directly.`;
+        break;
       case "native-binary":
         line = "This folder contains a native PC-style executable with no Android package. It will be added to your library as \"Imported - Runtime not detected\", since Android can't run it without a compatible runtime.";
         break;
@@ -281,6 +292,12 @@
     if (info.kind === "package-ref") {
       input.value = info.payload || "";
       hint.textContent = "Detected from this folder's package.txt. Edit it if it's wrong.";
+    } else if (info.kind === "installed-app") {
+      input.value = info.payload || "";
+      hint.textContent = "Detected from the folder name — this app is installed on your device.";
+    } else if (info.suggestedPackage) {
+      input.value = info.suggestedPackage;
+      hint.textContent = "The folder name looks like an app package, but that app isn't installed on this device. Install it, or edit/clear this field.";
     } else if (info.kind === "apk") {
       input.value = "";
       hint.textContent =
@@ -456,6 +473,8 @@
         return "Installable APK found in the folder";
       case "package-ref":
         return "Linked to an installed app (package.txt)";
+      case "installed-app":
+        return "Recognised an installed app from the folder name";
       case "native-binary":
         return "Native executable — needs a compatible runtime";
       case "game-data":

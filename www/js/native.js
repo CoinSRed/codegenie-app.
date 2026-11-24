@@ -56,8 +56,10 @@
      * Resolves: {
      *   uri, displayName, persisted,
      *   sizeBytes, fileCount, folderCount, truncated,
-     *   kind: "apk" | "package-ref" | "native-binary" | "game-data" | "unknown",
-     *   payload, signals: string[]
+     *   kind: "apk" | "package-ref" | "installed-app" | "native-binary" | "game-data" | "unknown",
+     *   payload, signals: string[],
+     *   detectedPackage, detectedLabel, detectedIcon  (folder named after an installed app),
+     *   suggestedPackage                             (folder looks like a package name, app not installed)
      * }
      * Rejects with err.code CANCELLED / PERMISSION_DENIED / EMPTY_FOLDER /
      * NO_PICKER / SCAN_FAILED.

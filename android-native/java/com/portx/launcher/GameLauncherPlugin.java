@@ -5,9 +5,12 @@ import android.content.ActivityNotFoundException;
 import android.content.ContentResolver;
 import android.content.Intent;
 import android.content.UriPermission;
+import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
+import android.graphics.drawable.Drawable;
 import android.net.Uri;
 import android.os.SystemClock;
 import android.util.Base64;
@@ -31,6 +34,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 /**
  * GameLauncherPlugin
@@ -70,6 +74,9 @@ public class GameLauncherPlugin extends Plugin {
     private static final int MAX_SCAN_ENTRIES = 4000;
     private static final long MAX_SCAN_MILLIS = 8000;
     private static final int COVER_MAX_DIMENSION = 800;
+    private static final int MAX_PACKAGE_CANDIDATES = 25;
+    // e.g. com.studio.game - used to recognise folders named after an Android package.
+    private static final Pattern PACKAGE_NAME = Pattern.compile("^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z0-9_]+)+$");
 
     // ---------------------------------------------------------------
     // Folder picking (Storage Access Framework)
@@ -262,6 +269,7 @@ public class GameLauncherPlugin extends Plugin {
         DocumentFile packageRefFile = null;
         DocumentFile nativeBinary = null;
         final Set<String> signals = new LinkedHashSet<>();
+        final Set<String> packageCandidates = new LinkedHashSet<>();
 
         boolean isEmpty() {
             return fileCount == 0 && folderCount == 0;
@@ -271,6 +279,7 @@ public class GameLauncherPlugin extends Plugin {
     private ScanResult scanTree(DocumentFile root) {
         ScanResult scan = new ScanResult();
         scan.deadline = SystemClock.elapsedRealtime() + MAX_SCAN_MILLIS;
+        addPackageCandidate(scan, root.getName());
         scanFolder(root, scan, 0);
         return scan;
     }
@@ -295,6 +304,7 @@ public class GameLauncherPlugin extends Plugin {
             if (child.isDirectory()) {
                 scan.folderCount++;
                 if (isGameFolderName(lower)) scan.signals.add("DATA");
+                addPackageCandidate(scan, name);
                 scanFolder(child, scan, depth + 1);
                 if (scan.truncated) return;
                 continue;
@@ -304,6 +314,11 @@ public class GameLauncherPlugin extends Plugin {
             scan.totalSize += Math.max(0, child.length());
             classifyFile(child, lower, scan);
         }
+    }
+
+    private void addPackageCandidate(ScanResult scan, String name) {
+        if (name == null || scan.packageCandidates.size() >= MAX_PACKAGE_CANDIDATES) return;
+        if (PACKAGE_NAME.matcher(name).matches()) scan.packageCandidates.add(name);
     }
 
     private boolean isGameFolderName(String lower) {
@@ -363,6 +378,9 @@ public class GameLauncherPlugin extends Plugin {
         for (String s : scan.signals) signals.put(s);
         ret.put("signals", signals);
 
+        // A folder named after an installed app (com.studio.game) identifies the game.
+        String detectedPackage = detectInstalledApp(scan, ret);
+
         if (scan.apkFile != null) {
             ret.put("kind", "apk");
             ret.put("payload", scan.apkFile.getUri().toString());
@@ -370,6 +388,9 @@ public class GameLauncherPlugin extends Plugin {
             String pkg = readSmallTextFile(scan.packageRefFile);
             ret.put("kind", "package-ref");
             ret.put("payload", pkg != null ? pkg.trim() : "");
+        } else if (detectedPackage != null) {
+            ret.put("kind", "installed-app");
+            ret.put("payload", detectedPackage);
         } else if (scan.nativeBinary != null) {
             ret.put("kind", "native-binary");
             ret.put("payload", scan.nativeBinary.getName());
@@ -379,6 +400,50 @@ public class GameLauncherPlugin extends Plugin {
             ret.put("kind", "unknown");
         }
         return ret;
+    }
+
+    /**
+     * Looks for a folder name that is the package name of an app installed on
+     * this device. On a hit, fills detectedPackage / detectedLabel / detectedIcon.
+     * If none is installed, the first candidate is reported as suggestedPackage.
+     */
+    private String detectInstalledApp(ScanResult scan, JSObject ret) {
+        PackageManager pm = getContext().getPackageManager();
+        for (String pkg : scan.packageCandidates) {
+            try {
+                ApplicationInfo info = pm.getApplicationInfo(pkg, 0);
+                ret.put("detectedPackage", pkg);
+                ret.put("detectedLabel", String.valueOf(pm.getApplicationLabel(info)));
+                String icon = iconDataUrl(pm.getApplicationIcon(info));
+                if (icon != null) ret.put("detectedIcon", icon);
+                return pkg;
+            } catch (PackageManager.NameNotFoundException ignored) {
+                // Not installed - try the next candidate.
+            } catch (Exception ignored) {
+                // Icon/label lookup failed - keep scanning.
+            }
+        }
+        if (!scan.packageCandidates.isEmpty()) {
+            ret.put("suggestedPackage", scan.packageCandidates.iterator().next());
+        }
+        return null;
+    }
+
+    private String iconDataUrl(Drawable drawable) {
+        if (drawable == null) return null;
+        try {
+            int size = 256;
+            Bitmap bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
+            Canvas canvas = new Canvas(bitmap);
+            drawable.setBounds(0, 0, size, size);
+            drawable.draw(canvas);
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, out);
+            bitmap.recycle();
+            return "data:image/png;base64," + Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private String readSmallTextFile(DocumentFile file) {
@@ -410,12 +475,14 @@ public class GameLauncherPlugin extends Plugin {
             call.reject("Missing 'packageName'.");
             return;
         }
+        PackageManager pm = getContext().getPackageManager();
         boolean installed;
         try {
-            getContext().getPackageManager().getPackageInfo(packageName, 0);
+            pm.getPackageInfo(packageName, 0);
             installed = true;
         } catch (PackageManager.NameNotFoundException e) {
-            installed = false;
+            // Fall back to the launcher lookup in case package visibility hides getPackageInfo.
+            installed = pm.getLaunchIntentForPackage(packageName) != null;
         }
         JSObject ret = new JSObject();
         ret.put("installed", installed);

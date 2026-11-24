@@ -49,6 +49,7 @@ jobs:
           p = "android/app/src/main/AndroidManifest.xml"
           s = open(p, encoding="utf-8").read()
           add = '''    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
               <queries>
                   <intent>
                       <action android:name="android.intent.action.MAIN" />

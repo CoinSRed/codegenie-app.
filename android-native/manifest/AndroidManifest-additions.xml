@@ -10,6 +10,11 @@
      install themselves; this only opens that system flow. -->
 <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
+<!-- Android 11+ package visibility: lets the launcher see whether a game's app
+     is installed (some ROMs hide apps even from the launcher <queries> below).
+     Fine for sideloaded builds; Google Play restricts this permission. -->
+<uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
 <!-- Needed on Android 11+ (API 30+) so the launcher is allowed to see
      which installed apps exist, for the "is this game already installed"
      check and for launching by package name. This is the standard,
