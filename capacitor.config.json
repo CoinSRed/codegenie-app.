@@ -1,0 +1,10 @@
+{
+  "appId": "com.portx.launcher",
+  "appName": "PORTX Game Launcher",
+  "webDir": "www",
+  "bundledWebRuntime": false,
+  "backgroundColor": "#0a0d13",
+  "android": {
+    "allowMixedContent": false
+  }
+}

@@ -1,0 +1,30 @@
+<!--
+  Merge these into android/app/src/main/AndroidManifest.xml, which
+  `npx cap add android` already generated for you.
+-->
+
+<!-- Inside the top-level <manifest> tag, alongside the existing <application>: -->
+
+<!-- Lets the launcher trigger the system package installer for an APK
+     found inside an imported folder. The user still has to approve the
+     install themselves; this only opens that system flow. -->
+<uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+<!-- Needed on Android 11+ (API 30+) so the launcher is allowed to see
+     which installed apps exist, for the "is this game already installed"
+     check and for launching by package name. This is the standard,
+     privacy-respecting way for a launcher-type app to see other apps
+     (as opposed to the broad QUERY_ALL_PACKAGES permission). -->
+<queries>
+    <intent>
+        <action android:name="android.intent.action.MAIN" />
+        <category android:name="android.intent.category.LAUNCHER" />
+    </intent>
+</queries>
+
+<!--
+  No broad storage permission (READ_EXTERNAL_STORAGE / MANAGE_EXTERNAL_STORAGE)
+  is required: folder import uses the Storage Access Framework
+  (ACTION_OPEN_DOCUMENT_TREE) via GameLauncherPlugin, which grants
+  scoped, persistable access to only the folder the user picks.
+-->

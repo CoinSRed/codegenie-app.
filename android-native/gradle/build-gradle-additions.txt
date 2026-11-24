@@ -1,0 +1,8 @@
+Merge into android/app/build.gradle, inside the existing `dependencies { ... }` block
+(npx cap add android already created this file with the Capacitor core deps in it):
+
+    implementation "androidx.documentfile:documentfile:1.0.1"
+
+That's the only extra dependency GameLauncherPlugin.java needs — everything
+else (Intent, PackageManager, File I/O) is part of the Android SDK already
+pulled in by the Capacitor Android template.
