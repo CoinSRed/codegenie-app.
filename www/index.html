@@ -71,14 +71,19 @@
     <div class="modal">
       <button class="modal-close" data-close>&times;</button>
       <h2>Add a game</h2>
-      <p class="modal-sub">Select the extracted game folder on your device.</p>
+      <p class="modal-sub">Select the extracted game folder on your device, or add a game manually.</p>
 
       <div class="step" id="stepPick">
         <button class="btn-outline" id="btnPickFolder">
           <svg viewBox="0 0 24 24"><path d="M3 7a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7Z" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
           Choose folder
         </button>
+        <button type="button" class="btn-outline" id="btnAddManual" style="margin-top:10px;">
+          <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          Add manually
+        </button>
         <p id="pickHint" class="hint"></p>
+        <p class="hint">Android 11+ won't let apps use a storage root, Download, Android/data or Android/obb directly. Pick the game's own folder (or a sub-folder) and tap "Use this folder".</p>
       </div>
 
       <div class="step hidden" id="stepDetails">

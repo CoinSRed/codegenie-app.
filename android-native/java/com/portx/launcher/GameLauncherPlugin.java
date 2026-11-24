@@ -1,14 +1,21 @@
 package com.portx.launcher;
 
 import android.app.Activity;
+import android.content.ActivityNotFoundException;
+import android.content.ContentResolver;
 import android.content.Intent;
+import android.content.UriPermission;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.net.Uri;
+import android.os.SystemClock;
 import android.util.Base64;
 
 import androidx.activity.result.ActivityResult;
 import androidx.documentfile.provider.DocumentFile;
 
+import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
@@ -20,6 +27,10 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
 
 /**
  * GameLauncherPlugin
@@ -27,31 +38,38 @@ import java.io.InputStream;
  * Native half of PORTX Game Launcher. Registered under the bridge name
  * "GameLauncher" and called from www/js/native.js.
  *
- * Folder-import convention
+ * Folder import
  * -------------------------------------------------------------------------
- * An extracted game folder picked through this plugin is classified as:
+ * pickFolder() opens the Storage Access Framework tree picker
+ * (ACTION_OPEN_DOCUMENT_TREE), persists read access with
+ * takePersistableUriPermission(), then walks the chosen tree with AndroidX
+ * DocumentFile - on a background thread, with a time and entry budget so a
+ * multi-GB game folder can never freeze the app.
  *
- *   "apk"            - the folder contains a .apk file. The game isn't
- *                       installed yet; installApk() starts the system
- *                       installer for it.
- *   "package-ref"     - the folder contains a small text file named
- *                       "package.txt" whose contents are the package name
- *                       of an app that is (or will be) installed on the
- *                       device, e.g. "com.studio.mygame". This lets a
- *                       folder of game assets point at the real
- *                       installed app so this launcher can start it.
- *   "native-binary"   - the folder contains an executable (ELF/PE) with no
- *                       Android package at all - a raw PC/console binary.
- *                       Android cannot run this without a compatible
- *                       runtime or engine, so this is reported, never
- *                       launched.
- *   "unknown"         - nothing recognizable was found.
+ * Rejection codes (err.code on the JS side):
+ *   CANCELLED          - the user backed out of the picker
+ *   PERMISSION_DENIED  - Android refused (or later revoked) access to the tree
+ *   EMPTY_FOLDER       - the folder has no files or sub-folders
+ *   NO_PICKER          - no app on the device can show a folder picker
+ *   SCAN_FAILED        - unexpected error while reading the folder
+ *
+ * Classification ("kind"):
+ *   apk            - contains a .apk (installable through the system installer)
+ *   package-ref    - contains package.txt naming an installed app to launch
+ *   native-binary  - contains a PC-style executable (.exe / .x86_64)
+ *   game-data      - contains game data (OBB, PAK, PCK, Data/ dirs, ...) but no
+ *                    launchable runtime
+ *   unknown        - non-empty folder with nothing recognisable
+ * Every kind is importable; the UI shows "Imported - Runtime not detected"
+ * when nothing launchable was found.
  */
 @CapacitorPlugin(name = "GameLauncher")
 public class GameLauncherPlugin extends Plugin {
 
     private static final int MAX_SCAN_DEPTH = 6;
-    private static final int MAX_SCAN_ENTRIES = 5000;
+    private static final int MAX_SCAN_ENTRIES = 4000;
+    private static final long MAX_SCAN_MILLIS = 8000;
+    private static final int COVER_MAX_DIMENSION = 800;
 
     // ---------------------------------------------------------------
     // Folder picking (Storage Access Framework)
@@ -61,72 +79,289 @@ public class GameLauncherPlugin extends Plugin {
     public void pickFolder(PluginCall call) {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
         intent.addFlags(
-            Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+            Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
         );
-        startActivityForResult(call, intent, "pickFolderResult");
+        try {
+            startActivityForResult(call, intent, "pickFolderResult");
+        } catch (ActivityNotFoundException e) {
+            call.reject("This device has no app that can pick a folder.", "NO_PICKER");
+        } catch (Exception e) {
+            call.reject("Couldn't open the folder picker: " + e.getMessage(), "NO_PICKER");
+        }
     }
 
     @ActivityCallback
-    private void pickFolderResult(PluginCall call, ActivityResult result) {
+    private void pickFolderResult(final PluginCall call, ActivityResult result) {
         if (call == null) return;
 
-        if (result.getResultCode() != Activity.RESULT_OK || result.getData() == null) {
-            call.reject("Folder selection was cancelled.");
+        Intent data = result.getData();
+        if (result.getResultCode() != Activity.RESULT_OK || data == null || data.getData() == null) {
+            call.reject("No folder was selected.", "CANCELLED");
             return;
         }
 
-        Uri treeUri = result.getData().getData();
-        if (treeUri == null) {
-            call.reject("No folder was returned by the picker.");
-            return;
-        }
+        final Uri treeUri = data.getData();
+        final boolean persisted = persistReadPermission(treeUri);
 
-        // Persist access so we can still read this folder after the app restarts.
+        // The activity callback runs on the main thread; scanning must not.
+        getBridge().execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    DocumentFile dir = DocumentFile.fromTreeUri(getContext(), treeUri);
+                    if (dir == null || !dir.exists() || !dir.isDirectory() || !dir.canRead()) {
+                        releaseQuietly(treeUri);
+                        call.reject(
+                            "Android denied access to that folder. Pick a sub-folder instead and tap \"Use this folder\".",
+                            "PERMISSION_DENIED"
+                        );
+                        return;
+                    }
+
+                    ScanResult scan = scanTree(dir);
+                    if (scan.isEmpty()) {
+                        releaseQuietly(treeUri);
+                        call.reject("That folder is empty.", "EMPTY_FOLDER");
+                        return;
+                    }
+
+                    JSObject ret = describe(scan);
+                    ret.put("uri", treeUri.toString());
+                    ret.put("displayName", dir.getName() != null ? dir.getName() : "Imported game");
+                    ret.put("persisted", persisted);
+                    call.resolve(ret);
+                } catch (SecurityException e) {
+                    releaseQuietly(treeUri);
+                    call.reject("Android denied access to that folder.", "PERMISSION_DENIED");
+                } catch (Exception e) {
+                    call.reject("Couldn't read that folder: " + e.getMessage(), "SCAN_FAILED");
+                }
+            }
+        });
+    }
+
+    /** Persists read access across restarts. Returns true only if Android confirms it. */
+    private boolean persistReadPermission(Uri treeUri) {
         try {
             getContext()
                 .getContentResolver()
-                .takePersistableUriPermission(
-                    treeUri,
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
-                );
+                .takePersistableUriPermission(treeUri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
         } catch (SecurityException e) {
-            // Some providers don't support persistable permissions; the folder
-            // still works for this session, so we don't fail the call for this.
+            return false;
         }
+        return isPersisted(treeUri);
+    }
 
-        DocumentFile dir = DocumentFile.fromTreeUri(getContext(), treeUri);
-        String name = (dir != null && dir.getName() != null) ? dir.getName() : "Imported game";
+    private boolean isPersisted(Uri treeUri) {
+        ContentResolver resolver = getContext().getContentResolver();
+        List<UriPermission> permissions = resolver.getPersistedUriPermissions();
+        for (UriPermission p : permissions) {
+            if (p.getUri().equals(treeUri) && p.isReadPermission()) return true;
+        }
+        return false;
+    }
 
-        JSObject ret = new JSObject();
-        ret.put("uri", treeUri.toString());
-        ret.put("displayName", name);
-        call.resolve(ret);
+    private void releaseQuietly(Uri treeUri) {
+        try {
+            getContext()
+                .getContentResolver()
+                .releasePersistableUriPermission(treeUri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        } catch (Exception ignored) {
+            // Nothing to release, or already released.
+        }
     }
 
     // ---------------------------------------------------------------
-    // Folder inspection
+    // Folder re-inspection / access checks
     // ---------------------------------------------------------------
 
     @PluginMethod
-    public void inspectFolder(PluginCall call) {
+    public void inspectFolder(final PluginCall call) {
+        final String uriStr = call.getString("uri");
+        if (uriStr == null || uriStr.isEmpty()) {
+            call.reject("Missing 'uri'.", "SCAN_FAILED");
+            return;
+        }
+
+        getBridge().execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    DocumentFile dir = DocumentFile.fromTreeUri(getContext(), Uri.parse(uriStr));
+                    if (dir == null || !dir.exists() || !dir.isDirectory() || !dir.canRead()) {
+                        call.reject(
+                            "This folder is no longer accessible. Permission may have been revoked.",
+                            "PERMISSION_DENIED"
+                        );
+                        return;
+                    }
+                    ScanResult scan = scanTree(dir);
+                    if (scan.isEmpty()) {
+                        call.reject("That folder is empty.", "EMPTY_FOLDER");
+                        return;
+                    }
+                    call.resolve(describe(scan));
+                } catch (SecurityException e) {
+                    call.reject("Android denied access to that folder.", "PERMISSION_DENIED");
+                } catch (Exception e) {
+                    call.reject("Couldn't read that folder: " + e.getMessage(), "SCAN_FAILED");
+                }
+            }
+        });
+    }
+
+    @PluginMethod
+    public void checkFolderAccess(final PluginCall call) {
+        final String uriStr = call.getString("uri");
+        if (uriStr == null || uriStr.isEmpty()) {
+            call.reject("Missing 'uri'.", "SCAN_FAILED");
+            return;
+        }
+
+        getBridge().execute(new Runnable() {
+            @Override
+            public void run() {
+                boolean accessible = false;
+                try {
+                    Uri uri = Uri.parse(uriStr);
+                    DocumentFile dir = DocumentFile.fromTreeUri(getContext(), uri);
+                    accessible = isPersisted(uri) && dir != null && dir.exists() && dir.canRead();
+                } catch (Exception ignored) {
+                    accessible = false;
+                }
+                JSObject ret = new JSObject();
+                ret.put("accessible", accessible);
+                call.resolve(ret);
+            }
+        });
+    }
+
+    /** Frees the persisted permission slot of a folder that was removed from the library. */
+    @PluginMethod
+    public void releaseFolder(PluginCall call) {
         String uriStr = call.getString("uri");
-        if (uriStr == null) {
-            call.reject("Missing 'uri'.");
-            return;
+        if (uriStr != null && !uriStr.isEmpty()) {
+            releaseQuietly(Uri.parse(uriStr));
         }
+        call.resolve(new JSObject());
+    }
 
-        DocumentFile dir = DocumentFile.fromTreeUri(getContext(), Uri.parse(uriStr));
-        if (dir == null || !dir.exists() || !dir.isDirectory()) {
-            call.reject("This folder is no longer accessible. Permission may have been revoked.");
-            return;
+    // ---------------------------------------------------------------
+    // Scanning
+    // ---------------------------------------------------------------
+
+    private static class ScanResult {
+        long totalSize = 0;
+        int fileCount = 0;
+        int folderCount = 0;
+        boolean truncated = false;
+        long deadline = 0;
+        DocumentFile apkFile = null;
+        DocumentFile packageRefFile = null;
+        DocumentFile nativeBinary = null;
+        final Set<String> signals = new LinkedHashSet<>();
+
+        boolean isEmpty() {
+            return fileCount == 0 && folderCount == 0;
         }
+    }
 
+    private ScanResult scanTree(DocumentFile root) {
         ScanResult scan = new ScanResult();
-        scanFolder(dir, scan, 0);
+        scan.deadline = SystemClock.elapsedRealtime() + MAX_SCAN_MILLIS;
+        scanFolder(root, scan, 0);
+        return scan;
+    }
 
+    /** Bounded walk (depth, entry count and wall-clock) so huge folders can't hang the app. */
+    private void scanFolder(DocumentFile dir, ScanResult scan, int depth) {
+        if (depth > MAX_SCAN_DEPTH) {
+            scan.truncated = true;
+            return;
+        }
+
+        for (DocumentFile child : dir.listFiles()) {
+            if (scan.fileCount + scan.folderCount >= MAX_SCAN_ENTRIES
+                || SystemClock.elapsedRealtime() > scan.deadline) {
+                scan.truncated = true;
+                return;
+            }
+
+            String name = child.getName();
+            String lower = name == null ? "" : name.toLowerCase(Locale.ROOT);
+
+            if (child.isDirectory()) {
+                scan.folderCount++;
+                if (isGameFolderName(lower)) scan.signals.add("DATA");
+                scanFolder(child, scan, depth + 1);
+                if (scan.truncated) return;
+                continue;
+            }
+
+            scan.fileCount++;
+            scan.totalSize += Math.max(0, child.length());
+            classifyFile(child, lower, scan);
+        }
+    }
+
+    private boolean isGameFolderName(String lower) {
+        return lower.equals("data")
+            || lower.equals("assets")
+            || lower.equals("streamingassets")
+            || lower.equals("obb")
+            || lower.equals("paks")
+            || lower.equals("binaries")
+            || lower.equals("content")
+            || lower.equals("engine")
+            || lower.equals("managed")
+            || lower.endsWith("_data");
+    }
+
+    private void classifyFile(DocumentFile file, String lower, ScanResult scan) {
+        if (lower.endsWith(".apk")) {
+            scan.signals.add("APK");
+            if (scan.apkFile == null) scan.apkFile = file;
+        } else if (lower.equals("package.txt")) {
+            scan.signals.add("package.txt");
+            if (scan.packageRefFile == null) scan.packageRefFile = file;
+        } else if (lower.endsWith(".obb")) {
+            scan.signals.add("OBB");
+        } else if (lower.endsWith(".pak")) {
+            scan.signals.add("PAK");
+        } else if (lower.endsWith(".pck")) {
+            scan.signals.add("PCK");
+        } else if (lower.endsWith(".exe")) {
+            scan.signals.add("EXE");
+            if (scan.nativeBinary == null) scan.nativeBinary = file;
+        } else if (lower.endsWith(".x86_64")) {
+            scan.signals.add("BIN");
+            if (scan.nativeBinary == null) scan.nativeBinary = file;
+        } else if (lower.endsWith(".dll")) {
+            scan.signals.add("DLL");
+        } else if (lower.endsWith(".so")) {
+            scan.signals.add("SO");
+        } else if (lower.endsWith(".unity3d")
+            || lower.endsWith(".assets")
+            || lower.endsWith(".ucas")
+            || lower.endsWith(".utoc")
+            || lower.endsWith(".wad")
+            || lower.endsWith(".vpk")) {
+            scan.signals.add("DATA");
+        }
+    }
+
+    private JSObject describe(ScanResult scan) {
         JSObject ret = new JSObject();
         ret.put("sizeBytes", scan.totalSize);
         ret.put("fileCount", scan.fileCount);
+        ret.put("folderCount", scan.folderCount);
+        ret.put("truncated", scan.truncated);
+
+        JSArray signals = new JSArray();
+        for (String s : scan.signals) signals.put(s);
+        ret.put("signals", signals);
 
         if (scan.apkFile != null) {
             ret.put("kind", "apk");
@@ -138,57 +373,12 @@ public class GameLauncherPlugin extends Plugin {
         } else if (scan.nativeBinary != null) {
             ret.put("kind", "native-binary");
             ret.put("payload", scan.nativeBinary.getName());
+        } else if (!scan.signals.isEmpty()) {
+            ret.put("kind", "game-data");
         } else {
             ret.put("kind", "unknown");
         }
-
-        call.resolve(ret);
-    }
-
-    private static class ScanResult {
-        long totalSize = 0;
-        int fileCount = 0;
-        DocumentFile apkFile = null;
-        DocumentFile packageRefFile = null;
-        DocumentFile nativeBinary = null;
-    }
-
-    /** Bounded breadth/depth walk so a huge or deeply-nested folder can't hang the app. */
-    private void scanFolder(DocumentFile dir, ScanResult scan, int depth) {
-        if (depth > MAX_SCAN_DEPTH || scan.fileCount > MAX_SCAN_ENTRIES) return;
-
-        for (DocumentFile child : dir.listFiles()) {
-            if (scan.fileCount > MAX_SCAN_ENTRIES) return;
-
-            if (child.isDirectory()) {
-                scanFolder(child, scan, depth + 1);
-                continue;
-            }
-
-            scan.fileCount++;
-            scan.totalSize += Math.max(0, child.length());
-
-            String name = child.getName();
-            if (name == null) continue;
-            String lower = name.toLowerCase();
-
-            if (scan.apkFile == null && lower.endsWith(".apk")) {
-                scan.apkFile = child;
-            } else if (scan.packageRefFile == null && lower.equals("package.txt")) {
-                scan.packageRefFile = child;
-            } else if (scan.nativeBinary == null && looksLikeNativeExecutable(lower)) {
-                scan.nativeBinary = child;
-            }
-        }
-    }
-
-    private boolean looksLikeNativeExecutable(String lowerName) {
-        return lowerName.endsWith(".exe")
-            || lowerName.endsWith(".dll")
-            || lowerName.endsWith(".so")
-            || lowerName.endsWith(".x86_64")
-            || lowerName.endsWith(".bin")
-            || (!lowerName.contains(".") && lowerName.length() > 0);
+        return ret;
     }
 
     private String readSmallTextFile(DocumentFile file) {
@@ -259,18 +449,20 @@ public class GameLauncherPlugin extends Plugin {
             return;
         }
 
-        Uri apkUri = Uri.parse(uriStr);
         Intent intent = new Intent(Intent.ACTION_VIEW);
-        intent.setDataAndType(apkUri, "application/vnd.android.package-archive");
+        intent.setDataAndType(Uri.parse(uriStr), "application/vnd.android.package-archive");
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
 
-        if (intent.resolveActivity(getContext().getPackageManager()) == null) {
+        // No resolveActivity() pre-check: on Android 11+ package visibility
+        // makes it return null even when a system installer exists.
+        try {
+            getContext().startActivity(intent);
+            call.resolve(new JSObject());
+        } catch (ActivityNotFoundException e) {
             call.reject("No package installer is available on this device.");
-            return;
+        } catch (SecurityException e) {
+            call.reject("Android blocked opening this APK. Allow PORTX to install apps in system settings and try again.");
         }
-
-        getContext().startActivity(intent);
-        call.resolve(new JSObject());
     }
 
     // ---------------------------------------------------------------
@@ -282,11 +474,15 @@ public class GameLauncherPlugin extends Plugin {
         Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
         intent.setType("image/*");
         intent.addCategory(Intent.CATEGORY_OPENABLE);
-        startActivityForResult(call, intent, "pickImageResult");
+        try {
+            startActivityForResult(call, intent, "pickImageResult");
+        } catch (ActivityNotFoundException e) {
+            call.reject("This device has no app that can pick an image.");
+        }
     }
 
     @ActivityCallback
-    private void pickImageResult(PluginCall call, ActivityResult result) {
+    private void pickImageResult(final PluginCall call, ActivityResult result) {
         if (call == null) return;
 
         if (result.getResultCode() != Activity.RESULT_OK || result.getData() == null) {
@@ -294,41 +490,75 @@ public class GameLauncherPlugin extends Plugin {
             return;
         }
 
-        Uri imageUri = result.getData().getData();
+        final Uri imageUri = result.getData().getData();
         if (imageUri == null) {
             call.reject("No image was returned.");
             return;
         }
 
-        try (InputStream in = getContext().getContentResolver().openInputStream(imageUri)) {
-            if (in == null) {
-                call.reject("Couldn't open the selected image.");
-                return;
-            }
-            ByteArrayOutputStream buffer = new ByteArrayOutputStream();
-            byte[] chunk = new byte[8192];
-            int read;
-            // Guard against picking an unexpectedly huge file (cap ~8MB source).
-            int total = 0;
-            while ((read = in.read(chunk)) != -1) {
-                buffer.write(chunk, 0, read);
-                total += read;
-                if (total > 8 * 1024 * 1024) {
+        getBridge().execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Bitmap bitmap = decodeScaled(imageUri, COVER_MAX_DIMENSION);
+                    if (bitmap == null) {
+                        call.reject("That file isn't a readable image.");
+                        return;
+                    }
+                    // Re-encoded + downscaled so the saved library stays small.
+                    ByteArrayOutputStream out = new ByteArrayOutputStream();
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out);
+                    bitmap.recycle();
+
+                    JSObject ret = new JSObject();
+                    ret.put(
+                        "dataUrl",
+                        "data:image/jpeg;base64," + Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+                    );
+                    call.resolve(ret);
+                } catch (IOException e) {
+                    call.reject("Failed to read the selected image: " + e.getMessage());
+                } catch (OutOfMemoryError e) {
                     call.reject("That image is too large to use as a cover.");
-                    return;
                 }
             }
+        });
+    }
 
-            String mime = getContext().getContentResolver().getType(imageUri);
-            if (mime == null) mime = "image/jpeg";
-            String b64 = Base64.encodeToString(buffer.toByteArray(), Base64.NO_WRAP);
+    private Bitmap decodeScaled(Uri uri, int maxDim) throws IOException {
+        ContentResolver resolver = getContext().getContentResolver();
 
-            JSObject ret = new JSObject();
-            ret.put("dataUrl", "data:" + mime + ";base64," + b64);
-            call.resolve(ret);
-        } catch (IOException e) {
-            call.reject("Failed to read the selected image: " + e.getMessage());
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        try (InputStream in = resolver.openInputStream(uri)) {
+            if (in == null) return null;
+            BitmapFactory.decodeStream(in, null, bounds);
         }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null;
+
+        int longest = Math.max(bounds.outWidth, bounds.outHeight);
+        int sample = 1;
+        while (longest / (sample * 2) >= maxDim) sample *= 2;
+
+        BitmapFactory.Options opts = new BitmapFactory.Options();
+        opts.inSampleSize = sample;
+        Bitmap bitmap;
+        try (InputStream in = resolver.openInputStream(uri)) {
+            if (in == null) return null;
+            bitmap = BitmapFactory.decodeStream(in, null, opts);
+        }
+        if (bitmap == null) return null;
+
+        int big = Math.max(bitmap.getWidth(), bitmap.getHeight());
+        if (big > maxDim) {
+            float scale = (float) maxDim / big;
+            int w = Math.max(1, Math.round(bitmap.getWidth() * scale));
+            int h = Math.max(1, Math.round(bitmap.getHeight() * scale));
+            Bitmap scaled = Bitmap.createScaledBitmap(bitmap, w, h, true);
+            if (scaled != bitmap) bitmap.recycle();
+            bitmap = scaled;
+        }
+        return bitmap;
     }
 
     // ---------------------------------------------------------------

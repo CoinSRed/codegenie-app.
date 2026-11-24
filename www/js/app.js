@@ -46,12 +46,11 @@
         return "Ready to play";
       case "needs-install":
         return "Not installed";
-      case "unsupported":
-        return "Unsupported format";
       case "checking":
         return "Checking…";
       default:
-        return "Imported";
+        // "imported" and the legacy "unsupported": added, but nothing launchable found.
+        return "Imported - Runtime not detected";
     }
   }
 
@@ -96,11 +95,10 @@
 
     grid.innerHTML = filtered
       .map((g) => {
-        const dotClass =
-          g.status === "ready" ? "ready" : g.status === "unsupported" ? "error" : "";
+        const dotClass = g.status === "ready" ? "ready" : "";
         const coverStyle = g.cover ? `style="background-image:url(${g.cover})"` : "";
         return `
-        <div class="game-card ${g.status === "unsupported" ? "unsupported" : ""}" data-id="${g.id}">
+        <div class="game-card" data-id="${g.id}">
           <div class="card-cover" ${coverStyle}>
             ${g.cover ? "" : coverFallbackSvg()}
             <span class="card-status-dot ${dotClass}"></span>
@@ -146,6 +144,7 @@
     $("#stepDetails").classList.add("hidden");
     $("#stepPick").classList.remove("hidden");
     $("#pickHint").textContent = "";
+    $("#btnPickFolder").disabled = false;
     $("#inputGameName").value = "";
     $("#inputPackageName").value = "";
     $("#packageNameHint").textContent = "";
@@ -158,40 +157,89 @@
     $$(".modal-overlay, .drawer").forEach((el) => el.classList.add("hidden"));
   }
 
+  const PICK_ERRORS = {
+    CANCELLED: "No folder was selected.",
+    PERMISSION_DENIED:
+      "Android denied access to that folder. On Android 11+ you can't pick a storage root, Download, Android/data or Android/obb directly — choose a sub-folder and tap \"Use this folder\".",
+    EMPTY_FOLDER: "That folder is empty. Pick the folder that actually contains the game files.",
+    NO_PICKER: "This device has no app that can pick a folder.",
+    NATIVE_UNAVAILABLE: "Folder import needs the Android app — this preview is browser-only.",
+  };
+
+  function pickErrorMessage(err) {
+    const key = err && (err.code || err.message);
+    return PICK_ERRORS[key] || (err && err.message) || "Couldn't read that folder.";
+  }
+
+  let pickBusy = false;
+
+  function showDetailsStep() {
+    $("#stepPick").classList.add("hidden");
+    $("#stepDetails").classList.remove("hidden");
+  }
+
   async function handlePickFolder() {
+    if (pickBusy) return;
     if (!NativeBridge.isNative()) {
-      toast("Folder picking needs the Android app — this preview is browser-only.", true);
+      toast(PICK_ERRORS.NATIVE_UNAVAILABLE, true);
       return;
     }
+    pickBusy = true;
+    $("#btnPickFolder").disabled = true;
     try {
-      $("#pickHint").textContent = "Opening folder picker…";
-      const { uri, displayName } = await NativeBridge.pickFolder();
-      $("#pickHint").textContent = `Reading "${displayName}"…`;
+      $("#pickHint").textContent =
+        "Choose the game folder. After you confirm, it is scanned (large games can take a few seconds)…";
+      const res = await NativeBridge.pickFolder();
 
-      const info = await NativeBridge.inspectFolder(uri);
       pendingImport = {
-        uri,
-        displayName,
-        kind: info.kind,
-        payload: info.payload,
-        sizeBytes: info.sizeBytes,
+        uri: res.uri,
+        displayName: res.displayName,
+        kind: res.kind,
+        payload: res.payload,
+        sizeBytes: res.sizeBytes || 0,
+        signals: res.signals || [],
+        persisted: res.persisted !== false,
+        truncated: !!res.truncated,
       };
 
-      $("#inputGameName").value = displayName || "";
-      renderDetectedInfo(info);
-      renderPackageField(info);
-
-      $("#stepPick").classList.add("hidden");
-      $("#stepDetails").classList.remove("hidden");
+      $("#inputGameName").value = res.displayName || "";
+      renderDetectedInfo(pendingImport);
+      renderPackageField(pendingImport);
+      showDetailsStep();
     } catch (err) {
       console.error(err);
-      $("#pickHint").textContent = "Folder selection was cancelled or failed.";
+      const msg = pickErrorMessage(err);
+      $("#pickHint").textContent = msg;
+      if (!err || err.code !== "CANCELLED") toast(msg, true);
+    } finally {
+      pickBusy = false;
+      $("#btnPickFolder").disabled = false;
     }
+  }
+
+  /** Manual entry: no folder, just a name (+ optional cover and package). */
+  function handleManualAdd() {
+    pendingImport = {
+      uri: null,
+      displayName: "",
+      kind: "manual",
+      payload: null,
+      sizeBytes: 0,
+      signals: [],
+      persisted: false,
+      truncated: false,
+    };
+    $("#inputGameName").value = "";
+    renderDetectedInfo(pendingImport);
+    renderPackageField(pendingImport);
+    showDetailsStep();
+    $("#inputGameName").focus();
   }
 
   function renderDetectedInfo(info) {
     const box = $("#detectedInfo");
     box.classList.add("show");
+    const found = info.signals && info.signals.length ? `Found: ${info.signals.join(", ")}.` : "";
     let line;
     switch (info.kind) {
       case "apk":
@@ -201,12 +249,29 @@
         line = `This folder is linked to the installed app "${info.payload}". It will launch directly.`;
         break;
       case "native-binary":
-        line = "This folder contains a native executable with no Android package. Most PC game binaries need a compatible runtime or engine that this launcher does not provide, so it can't be launched from here.";
+        line = "This folder contains a native PC-style executable with no Android package. It will be added to your library as \"Imported - Runtime not detected\", since Android can't run it without a compatible runtime.";
+        break;
+      case "game-data":
+        line = "Game data was found, but no launchable Android app. It will be added as \"Imported - Runtime not detected\". Link an installed app's package name below to enable Play.";
+        break;
+      case "manual":
+        line = "Manual entry — no folder is linked. It will be added as \"Imported - Runtime not detected\" unless you link an installed app below.";
         break;
       default:
-        line = "No launchable Android package or executable was found in this folder.";
+        line = "No recognisable game files were found, but the folder will still be added as \"Imported - Runtime not detected\".";
     }
-    box.innerHTML = `${line}<br><br>Size: ${formatBytes(info.sizeBytes)}`;
+
+    const extras = [];
+    if (found) extras.push(found);
+    if (info.kind !== "manual") extras.push(`Size: ${formatBytes(info.sizeBytes)}${info.truncated ? " (partial scan — folder is very large)" : ""}`);
+    if (info.kind !== "manual" && info.persisted === false) {
+      extras.push("Warning: Android didn't keep long-term access to this folder, so it may need to be re-added after a restart.");
+    }
+    box.textContent = "";
+    box.append(document.createTextNode(line));
+    extras.forEach((t) => {
+      box.append(document.createElement("br"), document.createElement("br"), document.createTextNode(t));
+    });
   }
 
   function renderPackageField(info) {
@@ -241,42 +306,65 @@
     }
   }
 
+  let saveBusy = false;
+
   async function handleSaveGame() {
+    if (saveBusy) return;
     const name = $("#inputGameName").value.trim();
     if (!name) {
       toast("Give the game a name first.", true);
       return;
     }
     if (!pendingImport) {
-      toast("Pick a folder first.", true);
+      toast("Choose a folder or use manual add first.", true);
+      return;
+    }
+    if (pendingImport.uri && games.some((g) => g.folderUri === pendingImport.uri)) {
+      toast("This folder is already in your library.", true);
       return;
     }
 
-    const manualPackage = $("#inputPackageName").value.trim();
-    const apkUri = pendingImport.kind === "apk" ? pendingImport.payload : null;
-    const packageName =
-      manualPackage || (pendingImport.kind === "package-ref" ? pendingImport.payload : null) || null;
+    saveBusy = true;
+    try {
+      const manualPackage = $("#inputPackageName").value.trim();
+      const apkUri = pendingImport.kind === "apk" ? pendingImport.payload : null;
+      const packageName =
+        manualPackage || (pendingImport.kind === "package-ref" ? pendingImport.payload : null) || null;
 
-    const status = await resolveStatus(packageName, apkUri);
+      const status = await resolveStatus(packageName, apkUri);
 
-    const game = {
-      id: uid(),
-      name,
-      folderUri: pendingImport.uri,
-      detectedKind: pendingImport.kind,
-      apkUri,
-      packageName,
-      sizeBytes: pendingImport.sizeBytes || 0,
-      cover: pendingCoverDataUrl,
-      status,
-      createdAt: Date.now(),
-      lastPlayed: 0,
-    };
+      const game = {
+        id: uid(),
+        name,
+        folderUri: pendingImport.uri || null,
+        detectedKind: pendingImport.kind,
+        detectedSignals: pendingImport.signals || [],
+        apkUri,
+        packageName,
+        sizeBytes: pendingImport.sizeBytes || 0,
+        cover: pendingCoverDataUrl,
+        status,
+        createdAt: Date.now(),
+        lastPlayed: 0,
+      };
 
-    games = await Storage.addGame(game);
-    render();
-    closeModals();
-    toast(`${name} added to your library.`);
+      try {
+        games = await Storage.addGame(game);
+        // Read back to be sure it really persisted (survives a restart).
+        const saved = await Storage.getLibrary();
+        if (!saved.some((g) => g.id === game.id)) throw new Error("Library write did not persist.");
+      } catch (e) {
+        console.error(e);
+        toast("Couldn't save the game to the library. Please try again.", true);
+        return;
+      }
+
+      render();
+      closeModals();
+      toast(`${name} added to your library.`);
+    } finally {
+      saveBusy = false;
+    }
   }
 
   /** Works out a game's status from what we currently know about it. */
@@ -290,7 +378,7 @@
       }
     }
     if (apkUri) return "needs-install";
-    return "unsupported";
+    return "imported";
   }
 
   // ---------- play / launch ----------
@@ -333,7 +421,7 @@
       }
 
       toast(
-        `${game.name} can't be launched directly. PC game ports need a compatible runtime or engine that this launcher doesn't provide.`,
+        `${game.name} is imported, but no runtime was detected. Open its details and link an installed app's package name to enable Play.`,
         true
       );
     } catch (err) {
@@ -370,6 +458,10 @@
         return "Linked to an installed app (package.txt)";
       case "native-binary":
         return "Native executable — needs a compatible runtime";
+      case "game-data":
+        return "Game data found — runtime not detected";
+      case "manual":
+        return "Added manually — no folder linked";
       default:
         return "No launchable package found";
     }
@@ -412,7 +504,7 @@
         <p class="hint">Size: ${formatBytes(game.sizeBytes)}</p>
         <p class="hint">Added: ${formatDate(game.createdAt)}</p>
         <p class="hint">Last played: ${formatDate(game.lastPlayed)}</p>
-        <p class="hint" style="word-break:break-all;">Source: ${escapeHtml(game.folderUri)}</p>
+        <p class="hint" style="word-break:break-all;">Source: ${escapeHtml(game.folderUri || "Manual entry (no folder linked)")}</p>
       </div>
 
       <div class="settings-group">
@@ -454,15 +546,28 @@
 
     $("#btnForget").onclick = async () => {
       games = await Storage.removeGame(id);
+      await releaseFolderIfUnused(game.folderUri);
       render();
       closeModals();
       toast(`${game.name} removed.`);
     };
   }
 
+  /** Frees the persisted SAF permission once no library entry uses that folder. */
+  async function releaseFolderIfUnused(uri) {
+    if (!uri || !NativeBridge.isNative()) return;
+    if (games.some((g) => g.folderUri === uri)) return;
+    try {
+      await NativeBridge.releaseFolder(uri);
+    } catch (e) {
+      // Non-fatal: the permission slot just stays allocated.
+    }
+  }
+
   async function removeGame(id) {
     const game = games.find((g) => g.id === id);
     games = await Storage.removeGame(id);
+    if (game) await releaseFolderIfUnused(game.folderUri);
     render();
     toast(game ? `${game.name} removed.` : "Game removed.");
   }
@@ -522,6 +627,7 @@
     $("#btnAddGame").addEventListener("click", openAddModal);
     $("#btnAddGameEmpty").addEventListener("click", openAddModal);
     $("#btnPickFolder").addEventListener("click", handlePickFolder);
+    $("#btnAddManual").addEventListener("click", handleManualAdd);
     $("#btnPickCover").addEventListener("click", handlePickCover);
     $("#btnSaveGame").addEventListener("click", handleSaveGame);
     $("#btnSettings").addEventListener("click", openLauncherSettings);
@@ -558,6 +664,30 @@
     wireEvents();
     games = await Storage.getLibrary();
     render();
+    checkFolderAccessOnStart();
+  }
+
+  /** Warns once if Android revoked access to any imported game folder. */
+  async function checkFolderAccessOnStart() {
+    if (!NativeBridge.isNative()) return;
+    let lost = 0;
+    for (const g of games) {
+      if (!g.folderUri) continue;
+      try {
+        const { accessible } = await NativeBridge.checkFolderAccess(g.folderUri);
+        if (!accessible) lost++;
+      } catch (e) {
+        lost++;
+      }
+    }
+    if (lost > 0) {
+      toast(
+        lost === 1
+          ? "Access to 1 game folder was lost. Remove it and add it again."
+          : `Access to ${lost} game folders was lost. Remove and re-add them.`,
+        true
+      );
+    }
   }
 
   document.addEventListener("DOMContentLoaded", init);
